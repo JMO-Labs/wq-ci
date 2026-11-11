@@ -30,7 +30,7 @@ The PAT needs Contents read/write only, never Workflows permission; autofix refu
 | `fix-cmd` | `""` | Idempotent fixer; runs only on same-repo `wq/*` PR branches. Empty disables |
 | `rerun-cmd` | test-cmd | Run after a failure, up to `reruns` times |
 | `reruns` | `2` | A pass on rerun posts a `wq-flaky: <sha>` comment and passes the job |
-| `base` | `dev` | diff-cover compares against `origin/<base>` |
+| `base` | PR base branch | diff-cover compares against `origin/<base>`; empty = the PR's own base |
 | `wq-ci-ref` | `v1` | Ref of this repo whose `scripts/wqci.py` is used |
 
 Coverage gaps post a `wq-coverage: <sha>` comment and never block the PR.

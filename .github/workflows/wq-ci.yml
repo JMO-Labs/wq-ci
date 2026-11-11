@@ -23,9 +23,9 @@ on:
         type: number
         default: 2
       base:
-        description: Branch diff-cover compares against.
+        description: Branch diff-cover compares against. Empty uses the PR's base branch.
         type: string
-        default: dev
+        default: ""
       wq-ci-ref:
         description: Ref of JMO-Labs/wq-ci whose scripts are used.
         type: string
@@ -194,7 +194,7 @@ jobs:
           name: wq-coverage
       - name: Diff coverage
         env:
-          BASE: ${{ inputs.base }}
+          BASE: ${{ inputs.base || github.base_ref || 'dev' }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           pipx run --spec diff-cover==9.7.2 diff-cover coverage.xml --compare-branch "origin/$BASE" --json-report dc.json
