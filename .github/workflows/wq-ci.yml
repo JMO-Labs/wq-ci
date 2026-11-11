@@ -171,7 +171,7 @@ jobs:
 
   coverage:
     needs: test
-    if: github.event_name == 'pull_request'
+    if: ${{ !cancelled() && needs.test.result == 'success' && github.event_name == 'pull_request' }}
     # Coverage gaps never block the PR; the dispatcher files a tester ticket on merge.
     continue-on-error: true
     runs-on: ubuntu-latest
