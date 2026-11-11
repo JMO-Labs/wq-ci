@@ -1,0 +1,209 @@
+# wq-ci: reusable gate for wq projects. Source of truth: as_work-q ci/github/,
+# published to JMO-Labs/wq-ci (tag v1). Markers posted here are read by the
+# dispatcher: first line `wq-coverage: <sha40>` / `wq-flaky: <sha40>`.
+name: wq-ci
+
+on:
+  workflow_call:
+    inputs:
+      test-cmd:
+        description: Test command; must write coverage.xml and junit.xml in the repo root.
+        type: string
+        required: true
+      fix-cmd:
+        description: Idempotent autofix command (formatter/linter --fix). Empty disables autofix.
+        type: string
+        default: ""
+      rerun-cmd:
+        description: Command for reruns after a failure. Empty means test-cmd.
+        type: string
+        default: ""
+      reruns:
+        description: Reruns after a failed test-cmd before the job fails.
+        type: number
+        default: 2
+      base:
+        description: Branch diff-cover compares against.
+        type: string
+        default: dev
+      wq-ci-ref:
+        description: Ref of JMO-Labs/wq-ci whose scripts are used.
+        type: string
+        default: v1
+    secrets:
+      WQ_AUTOFIX_TOKEN:
+        description: contents:write PAT; GITHUB_TOKEN pushes trigger no workflow.
+        required: false
+
+# No workflow-level permissions: each job asks for the least it needs.
+concurrency:
+  group: wq-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # autofix runs PR code (fix-cmd): no secrets, no persisted credentials; it only emits a patch.
+  autofix:
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'wq/') && inputs.fix-cmd != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      has_patch: ${{ steps.patch.outputs.has_patch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Run fix-cmd
+        run: bash -c "$FIX_CMD"
+        env:
+          FIX_CMD: ${{ inputs.fix-cmd }}
+      - id: patch
+        name: Collect patch
+        run: |
+          git add -A && git diff --cached --binary > autofix.patch
+          if [ -s autofix.patch ]; then echo "has_patch=true" >> "$GITHUB_OUTPUT"; else echo "no autofix changes"; fi
+      - if: steps.patch.outputs.has_patch == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: autofix-patch
+          path: autofix.patch
+
+  # autofix-push never runs PR code: fresh checkout, apply the patch, commit and push with hooks disabled.
+  autofix-push:
+    needs: autofix
+    if: needs.autofix.outputs.has_patch == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read  # the PAT does the push
+    outputs:
+      pushed: ${{ steps.push.outputs.pushed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: autofix-patch
+          path: ${{ runner.temp }}/autofix
+      - name: Commit autofix
+        env:
+          PATCH_DIR: ${{ runner.temp }}/autofix  # outside the worktree, so the patch is never committed
+        run: |
+          git apply --index "$PATCH_DIR/autofix.patch"
+          if ! git diff --cached --no-renames --quiet -- ':(icase).github'; then
+            echo "::error::autofix patch touches .github/; refusing to push (workflow files need a human)"
+            exit 1
+          fi
+          git -c user.name=wq-autofix -c user.email=wq-autofix@users.noreply.github.com \
+            -c core.hooksPath=/dev/null -c core.fsmonitor=false commit --no-verify -qm "style: autofix"
+      - id: push
+        name: Push autofix
+        env:
+          TOKEN: ${{ secrets.WQ_AUTOFIX_TOKEN }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            git --no-pager show --binary --format= HEAD
+            echo "::error::fix-cmd changed files and WQ_AUTOFIX_TOKEN is not set; apply the diff above"
+            exit 1
+          fi
+          # Token only via env-provided git config in this step, never argv or .git/config.
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+          export GIT_CONFIG_VALUE_0
+          git -c core.hooksPath=/dev/null -c core.fsmonitor=false push --no-verify origin "HEAD:refs/heads/$HEAD_REF"
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: [autofix, autofix-push]
+    # !cancelled(): still run when autofix is skipped (forks, non-wq branches, no fix-cmd) or fails.
+    # A successful autofix push starts a new run on the fixed commit, so this one stands down.
+    if: ${{ !cancelled() && needs.autofix-push.result != 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: JMO-Labs/wq-ci
+          ref: ${{ inputs.wq-ci-ref }}
+          path: .wq-ci
+          persist-credentials: false
+      - name: Test (with flaky reruns)
+        env:
+          TEST_CMD: ${{ inputs.test-cmd }}
+          RERUN_CMD: ${{ inputs.rerun-cmd }}
+          RERUNS: ${{ inputs.reruns }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if bash -c "$TEST_CMD"; then exit 0; fi
+          [ -f junit.xml ] && cp junit.xml junit-1.xml
+          passed=false
+          for i in $(seq 1 "$RERUNS"); do
+            echo "::warning::test-cmd failed; rerun $i/$RERUNS"
+            if bash -c "${RERUN_CMD:-$TEST_CMD}"; then passed=true; break; fi
+          done
+          [ "$passed" = true ] || exit 1
+          if [ -n "$PR" ] && [ -f junit-1.xml ] && [ -f junit.xml ]; then
+            python3 .wq-ci/scripts/wqci.py flaky-body junit-1.xml junit.xml "$HEAD_SHA" > "$RUNNER_TEMP/wq-flaky.md"
+          fi
+      - name: Comment flaky marker
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          f="$RUNNER_TEMP/wq-flaky.md"
+          if [ -n "$PR" ] && [ -s "$f" ]; then gh pr comment "$PR" --body-file "$f" || echo "::warning::comment failed"; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wq-coverage
+          path: coverage.xml
+          if-no-files-found: ignore
+
+  coverage:
+    needs: test
+    if: github.event_name == 'pull_request'
+    # Coverage gaps never block the PR; the dispatcher files a tester ticket on merge.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: JMO-Labs/wq-ci
+          ref: ${{ inputs.wq-ci-ref }}
+          path: .wq-ci
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: wq-coverage
+      - name: Diff coverage
+        env:
+          BASE: ${{ inputs.base }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          pipx run --spec diff-cover==9.7.2 diff-cover coverage.xml --compare-branch "origin/$BASE" --json-report dc.json
+          python3 .wq-ci/scripts/wqci.py coverage-body dc.json "$HEAD_SHA" > "$RUNNER_TEMP/wq-coverage.md"
+      - name: Comment coverage marker
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          f="$RUNNER_TEMP/wq-coverage.md"
+          if [ -s "$f" ]; then gh pr comment "$PR" --body-file "$f" || echo "::warning::comment failed"; fi
